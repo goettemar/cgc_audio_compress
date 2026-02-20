@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-import io
 import logging
+import struct
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 import torchaudio
 
@@ -17,11 +18,68 @@ from .base import BaseAudioCodec, ProgressCallback
 
 logger = logging.getLogger(__name__)
 
+# Binary format: ECDC<version:u8><model_sr:u32><bandwidth:f32><n_frames:u16>
+# Per frame: <has_scale:u8>[<scale:f32>]<n_codebooks:u16><n_steps:u32><codes: int16[]>
+_MAGIC = b"ECDC"
+_VERSION = 1
+_HEADER = struct.Struct("<4sBIfH")  # magic, version, model_sr, bandwidth, n_frames
+
 
 def _get_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
     return torch.device("cpu")
+
+
+def _save_ecdc(path: Path, model_sr: int, bandwidth: float, frames: list) -> None:
+    """Save encoded frames in compact binary format."""
+    parts = [_HEADER.pack(_MAGIC, _VERSION, model_sr, bandwidth, len(frames))]
+
+    for codes, scale in frames:
+        # codes shape: (batch, n_codebooks, n_steps) — drop batch dim
+        c = codes.squeeze(0).cpu().to(torch.int16).numpy()
+        n_codebooks, n_steps = c.shape
+
+        has_scale = scale is not None
+        parts.append(struct.pack("<B", int(has_scale)))
+        if has_scale:
+            parts.append(struct.pack("<f", scale.item()))
+        parts.append(struct.pack("<HI", n_codebooks, n_steps))
+        parts.append(c.tobytes())
+
+    path.write_bytes(b"".join(parts))
+
+
+def _load_ecdc(path: Path) -> tuple[int, float, list]:
+    """Load encoded frames from compact binary format."""
+    data = path.read_bytes()
+    offset = 0
+
+    magic, version, model_sr, bandwidth, n_frames = _HEADER.unpack_from(data, offset)
+    offset += _HEADER.size
+    assert magic == _MAGIC, f"Not an ECDC file: {magic!r}"
+    assert version == _VERSION, f"Unsupported version: {version}"
+
+    frames = []
+    for _ in range(n_frames):
+        has_scale = struct.unpack_from("<B", data, offset)[0]
+        offset += 1
+
+        scale = None
+        if has_scale:
+            scale = torch.tensor([[struct.unpack_from("<f", data, offset)[0]]])
+            offset += 4
+
+        n_codebooks, n_steps = struct.unpack_from("<HI", data, offset)
+        offset += 6
+
+        nbytes = n_codebooks * n_steps * 2  # int16
+        codes_np = np.frombuffer(data, dtype=np.int16, count=n_codebooks * n_steps, offset=offset)
+        offset += nbytes
+        codes = torch.from_numpy(codes_np.reshape(1, n_codebooks, n_steps).copy()).long()
+        frames.append((codes, scale))
+
+    return model_sr, bandwidth, frames
 
 
 class EnCodecBackend(BaseAudioCodec):
@@ -90,12 +148,10 @@ class EnCodecBackend(BaseAudioCodec):
         if progress_cb:
             progress_cb("Lade Audio...", 10, 100)
 
-        # Load and prepare audio
         waveform, sr = load_audio(audio_path)
         original_size = audio_path.stat().st_size
         duration = waveform.shape[1] / sr
 
-        # Resample if needed
         if sr != self._model_sr:
             if progress_cb:
                 progress_cb(f"Resample {sr} -> {self._model_sr} Hz...", 20, 100)
@@ -103,17 +159,14 @@ class EnCodecBackend(BaseAudioCodec):
 
         # Ensure correct channel count
         if self._model_sr == 48000:
-            # 48kHz model expects stereo
             if waveform.shape[0] == 1:
                 waveform = waveform.repeat(2, 1)
             elif waveform.shape[0] > 2:
                 waveform = waveform[:2]
         else:
-            # 24kHz model expects mono
             if waveform.shape[0] > 1:
                 waveform = waveform.mean(dim=0, keepdim=True)
 
-        # Add batch dimension: (1, channels, samples)
         audio = waveform.unsqueeze(0).to(device)
 
         if progress_cb:
@@ -127,22 +180,9 @@ class EnCodecBackend(BaseAudioCodec):
         if progress_cb:
             progress_cb("Speichere...", 80, 100)
 
-        # Serialize frames with torch.save
         out = Path(str(output_path).removesuffix(self.file_suffix) + self.file_suffix)
         out.parent.mkdir(parents=True, exist_ok=True)
-
-        # Store codes + scales + metadata
-        save_data = {
-            "model_sr": self._model_sr,
-            "bandwidth": bandwidth,
-            "frames": [
-                (codes.cpu(), scale.cpu() if scale is not None else None)
-                for codes, scale in encoded_frames
-            ],
-        }
-        buf = io.BytesIO()
-        torch.save(save_data, buf)
-        out.write_bytes(buf.getvalue())
+        _save_ecdc(out, self._model_sr, bandwidth, encoded_frames)
 
         encode_time = time.perf_counter() - t0
         compressed_size = out.stat().st_size
@@ -182,15 +222,13 @@ class EnCodecBackend(BaseAudioCodec):
         if progress_cb:
             progress_cb("Lade komprimierte Datei...", 20, 100)
 
-        save_data = torch.load(compressed_path, map_location="cpu", weights_only=False)
-        encoded_frames = save_data["frames"]
+        _model_sr, _bandwidth, encoded_frames = _load_ecdc(compressed_path)
 
         if progress_cb:
             progress_cb("Dekomprimiere...", 40, 100)
 
         t0 = time.perf_counter()
 
-        # Move frames to device
         encoded_frames = [
             (codes.to(device), scale.to(device) if scale is not None else None)
             for codes, scale in encoded_frames
@@ -201,7 +239,6 @@ class EnCodecBackend(BaseAudioCodec):
 
         decode_time = time.perf_counter() - t0
 
-        # audio shape: (1, channels, samples) — remove batch dim
         waveform = audio.squeeze(0).cpu()
         duration = waveform.shape[1] / self._model_sr
 
