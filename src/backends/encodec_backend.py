@@ -51,14 +51,27 @@ def _save_ecdc(path: Path, model_sr: int, bandwidth: float, frames: list) -> Non
 
 
 def _load_ecdc(path: Path) -> tuple[int, float, list]:
-    """Load encoded frames from compact binary format."""
+    """Load encoded frames from compact binary format or legacy torch.save."""
     data = path.read_bytes()
+
+    # Legacy: torch.save/pickle format (starts with PK zip or \x80 pickle)
+    # Backwards compat for .ecdc files created before binary format switch.
+    # These are self-generated files, not from untrusted sources.
+    if data[:2] in (b"PK", b"\x80\x02"):
+        logger.info("Loading legacy torch.save format: %s", path.name)
+        save_data = torch.load(path, map_location="cpu", weights_only=False)
+        model_sr = save_data.get("model_sr", 48000)
+        bandwidth = save_data.get("bandwidth", 6.0)
+        return model_sr, bandwidth, save_data["frames"]
+
     offset = 0
 
     magic, version, model_sr, bandwidth, n_frames = _HEADER.unpack_from(data, offset)
     offset += _HEADER.size
-    assert magic == _MAGIC, f"Not an ECDC file: {magic!r}"
-    assert version == _VERSION, f"Unsupported version: {version}"
+    if magic != _MAGIC:
+        raise ValueError(f"Not an ECDC file: {magic!r}")
+    if version != _VERSION:
+        raise ValueError(f"Unsupported ECDC version: {version}")
 
     frames = []
     for _ in range(n_frames):
