@@ -18,11 +18,49 @@ logger = logging.getLogger(__name__)
 def load_audio(path: str | Path) -> tuple[torch.Tensor, int]:
     """Load audio file and return (waveform, sample_rate).
 
+    Tries torchaudio first, falls back to ffmpeg for formats
+    that torchcodec cannot handle (e.g. MP3).
     Waveform shape: (channels, samples).
     """
     path = Path(path)
-    waveform, sr = torchaudio.load(str(path))
-    return waveform, sr
+    try:
+        waveform, sr = torchaudio.load(str(path))
+        return waveform, sr
+    except Exception:
+        logger.debug("torchaudio.load failed, using ffmpeg fallback", exc_info=True)
+        return _load_audio_ffmpeg(path)
+
+
+def _load_audio_ffmpeg(path: Path, target_sr: int = 48000) -> tuple[torch.Tensor, int]:
+    """Load audio via ffmpeg, decoding to raw PCM float32."""
+    import numpy as np
+
+    # Probe channel count
+    info = _get_info_ffprobe(path)
+    channels = info.channels or 2
+
+    result = subprocess.run(
+        [
+            "ffmpeg",
+            "-v", "quiet",
+            "-i", str(path),
+            "-f", "f32le",
+            "-acodec", "pcm_f32le",
+            "-ar", str(target_sr),
+            "-ac", str(channels),
+            "pipe:1",
+        ],
+        capture_output=True,
+        timeout=120,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg decode failed for {path}")
+
+    audio_np = np.frombuffer(result.stdout, dtype=np.float32)
+    # Reshape to (channels, samples)
+    audio_np = audio_np.reshape(-1, channels).T
+    waveform = torch.from_numpy(audio_np.copy())
+    return waveform, target_sr
 
 
 def save_audio(waveform: torch.Tensor, path: str | Path, sample_rate: int) -> None:

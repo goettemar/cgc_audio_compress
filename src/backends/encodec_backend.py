@@ -11,6 +11,7 @@ import torch
 import torchaudio
 
 from .. import registry
+from ..audio_io import load_audio
 from ..models import CompressResult, DecompressResult, ParamSpec, ParamType
 from .base import BaseAudioCodec, ProgressCallback
 
@@ -90,7 +91,7 @@ class EnCodecBackend(BaseAudioCodec):
             progress_cb("Lade Audio...", 10, 100)
 
         # Load and prepare audio
-        waveform, sr = torchaudio.load(str(audio_path))
+        waveform, sr = load_audio(audio_path)
         original_size = audio_path.stat().st_size
         duration = waveform.shape[1] / sr
 
