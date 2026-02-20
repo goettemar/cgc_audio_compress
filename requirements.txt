@@ -1,0 +1,5 @@
+PySide6>=6.6
+encodec>=0.1.1
+torch>=2.0
+torchaudio>=2.0
+numpy>=1.26
