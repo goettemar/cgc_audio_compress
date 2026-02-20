@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import logging
 import time
 from pathlib import Path
@@ -68,7 +69,7 @@ class EnCodecBackend(BaseAudioCodec):
         else:
             self._model = EncodecModel.encodec_model_24khz()
         self._model.to(_get_device())
-        self._model.set_num_codebooks_inference()
+        self._model.eval()
 
     def compress(
         self,
@@ -83,7 +84,7 @@ class EnCodecBackend(BaseAudioCodec):
         self._load_model()
         device = _get_device()
         bandwidth = float(params.get("bandwidth", 6.0))
-        self._model.set_target_bandwidths([bandwidth])
+        self._model.set_target_bandwidth(bandwidth)
 
         if progress_cb:
             progress_cb("Lade Audio...", 10, 100)
@@ -125,12 +126,22 @@ class EnCodecBackend(BaseAudioCodec):
         if progress_cb:
             progress_cb("Speichere...", 80, 100)
 
-        # Save compressed using encodec's built-in format
-        from encodec.utils import save_to_file
-
+        # Serialize frames with torch.save
         out = Path(str(output_path).removesuffix(self.file_suffix) + self.file_suffix)
         out.parent.mkdir(parents=True, exist_ok=True)
-        save_to_file(out, self._model.get_config(), encoded_frames)
+
+        # Store codes + scales + metadata
+        save_data = {
+            "model_sr": self._model_sr,
+            "bandwidth": bandwidth,
+            "frames": [
+                (codes.cpu(), scale.cpu() if scale is not None else None)
+                for codes, scale in encoded_frames
+            ],
+        }
+        buf = io.BytesIO()
+        torch.save(save_data, buf)
+        out.write_bytes(buf.getvalue())
 
         encode_time = time.perf_counter() - t0
         compressed_size = out.stat().st_size
@@ -170,9 +181,8 @@ class EnCodecBackend(BaseAudioCodec):
         if progress_cb:
             progress_cb("Lade komprimierte Datei...", 20, 100)
 
-        from encodec.utils import load_from_file
-
-        config, encoded_frames = load_from_file(compressed_path)
+        save_data = torch.load(compressed_path, map_location="cpu", weights_only=False)
+        encoded_frames = save_data["frames"]
 
         if progress_cb:
             progress_cb("Dekomprimiere...", 40, 100)
